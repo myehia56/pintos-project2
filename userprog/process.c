@@ -15,6 +15,7 @@
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/palloc.h"
+#include "threads/malloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
@@ -30,8 +31,13 @@ static bool load (const char *cmdline, void (**eip) (void), void **esp);
 tid_t
 process_execute (const char *file_name) 
 {
-  char *fn_copy = palloc_get_page (0);
-  if (fn_copy == NULL) return TID_ERROR;
+  char *fn_copy;
+  tid_t tid;
+
+  /* Make a copy of FILE_NAME. */
+  fn_copy = palloc_get_page (0);
+  if (fn_copy == NULL)
+    return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
   /* Extract thread name safely without touching the read-only file_name */
@@ -40,20 +46,43 @@ process_execute (const char *file_name)
   char *save_ptr;
   strtok_r(thread_name, " ", &save_ptr);
 
-  tid_t tid = thread_create (thread_name, PRI_DEFAULT, start_process, fn_copy);
+  /* Disable interrupts so the child doesn't start running before we set up the mailbox! */
+  enum intr_level old_level = intr_disable();
+  
+  tid = thread_create (thread_name, PRI_DEFAULT, start_process, fn_copy);
   if (tid == TID_ERROR) {
-      palloc_free_page (fn_copy);
+      palloc_free_page (fn_copy); 
+      intr_set_level(old_level);
       return -1;
   }
 
-  /* Wait for child to load safely */
+  /* Grab the newly created child thread and build its mailbox */
   struct thread *child = thread_get_by_tid(tid);
-  if (child != NULL) {
-      sema_down(&child->load_sema);
-      if (!child->load_success) {
-          return -1; 
-      }
+  struct child_status *cs = malloc(sizeof(struct child_status));
+  
+  cs->tid = tid;
+  cs->is_alive = true;
+  cs->was_waited_on = false;
+  cs->exit_status = -1;
+  cs->load_success = false;
+  sema_init(&cs->wait_sema, 0);
+  sema_init(&cs->load_sema, 0);
+
+  /* Hand the mailbox to the child, and add it to our parent list */
+  child->my_status = cs;
+  list_push_back(&thread_current()->children, &cs->elem);
+
+  /* Safe to let the child run now! */
+  intr_set_level(old_level); 
+
+  /* Go to sleep until the child finishes loading in start_process() */
+  sema_down(&cs->load_sema);
+  
+  /* Did it fail to load (e.g., file doesn't exist)? */
+  if (!cs->load_success) {
+      return -1;
   }
+
   return tid;
 }
 
@@ -77,12 +106,8 @@ start_process (void *file_name_)
 
   success = load (thread_name, &if_.eip, &if_.esp);
 
-  /* Record success and wake up the parent waiting in process_execute */
-  thread_current()->load_success = success;
-  sema_up(&thread_current()->load_sema);
-
   if (success) {
-      /* The Stack Mechanic */
+      /* --- YOUR FRIEND'S STACK MECHANIC CODE (PRESERVED) --- */
       char *token;
       int argc = 0;
       char *argv[64];
@@ -121,13 +146,25 @@ start_process (void *file_name_)
 
       if_.esp -= sizeof(void *);
       *(void **)if_.esp = NULL;
+      /* --- END STACK MECHANIC CODE --- */
   }
 
   palloc_free_page (file_name);
-  
-  if (!success) 
-    thread_exit ();
 
+  /* Wake up the parent and tell them if the load was successful! */
+  struct thread *cur = thread_current();
+  if (cur->my_status != NULL) {
+      cur->my_status->load_success = success;
+      sema_up(&cur->my_status->load_sema);
+  }
+
+  /* If load failed, quit gracefully. */
+  if (!success) {
+      cur->exit_status = -1;
+      thread_exit ();
+  }
+
+  /* Start the user process */
   asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
   NOT_REACHED ();
 }
@@ -135,20 +172,40 @@ start_process (void *file_name_)
 int
 process_wait (tid_t child_tid) 
 {
-  struct thread *child = thread_get_by_tid(child_tid);
-  
-  if (child == NULL || child->is_waited_on) {
-    return -1; 
-  }
-  
-  child->is_waited_on = true; 
+  struct thread *cur = thread_current();
+  struct list_elem *e;
+  struct child_status *child_box = NULL;
 
-  sema_down(&child->wait_sema);
-  int status = child->exit_status;
-  sema_up(&child->exit_sema);
-  
+  /* Look for the requested child in our mailbox list */
+  for (e = list_begin(&cur->children); e != list_end(&cur->children); e = list_next(e)) {
+      struct child_status *cs = list_entry(e, struct child_status, elem);
+      if (cs->tid == child_tid) {
+          child_box = cs;
+          break;
+      }
+  }
+
+  /* If the child doesn't exist, or we already waited on it, return -1 */
+  if (child_box == NULL || child_box->was_waited_on) {
+      return -1;
+  }
+
+  /* Mark it so we can't wait on it twice */
+  child_box->was_waited_on = true;
+
+  /* If the child is still running, go to sleep! */
+  if (child_box->is_alive) {
+      sema_down(&child_box->wait_sema);
+  }
+
+  /* Once awake, grab the status, clean up the heap box, and return */
+  int status = child_box->exit_status;
+  list_remove(&child_box->elem);
+  free(child_box);
+
   return status;
 }
+
 /* Free the current process's resources. */
 void
 process_exit (void)
@@ -172,34 +229,31 @@ process_exit (void)
   if (cur->exec_file != NULL) 
     {
       lock_acquire(&filesys_lock);
+      file_allow_write(cur->exec_file); // Added file_allow_write
       file_close(cur->exec_file);
       lock_release(&filesys_lock);
       cur->exec_file = NULL;
     }
 
+  /* 3. Drop our status in the mailbox and wake up the sleeping parent! */
+  if (cur->my_status != NULL) {
+      cur->my_status->exit_status = cur->exit_status;
+      cur->my_status->is_alive = false;
+      sema_up(&cur->my_status->wait_sema);
+  }
 
-/* 1. Signal the parent that we are done! */
-sema_up(&cur->wait_sema);
-
-/* 2. Go to sleep and wait for the parent to grab the status before we destroy our memory! */
-sema_down(&cur->exit_sema);
-
-/* Yield the CPU immediately so the parent can grab the status 
-   before this thread memory is destroyed */
-thread_yield();
+  /* 4. If WE had children, free their orphaned mailboxes so heap memory doesn't leak */
+  while (!list_empty(&cur->children)) {
+      struct list_elem *e = list_pop_front(&cur->children);
+      struct child_status *cs = list_entry(e, struct child_status, elem);
+      free(cs);
+  }
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
   if (pd != NULL) 
     {
-      /* Correct ordering here is crucial.  We must set
-         cur->pagedir to NULL before switching page directories,
-         so that a timer interrupt can't switch back to the
-         process page directory.  We must activate the base page
-         directory before destroying the process's page
-         directory, or our active page directory will be one
-         that's been freed (and cleared). */
       cur->pagedir = NULL;
       pagedir_activate (NULL);
       pagedir_destroy (pd);

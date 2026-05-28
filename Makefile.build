@@ -89,7 +89,9 @@ threads/loader.o: threads/loader.S
 	$(CC) -c $< -o $@ $(ASFLAGS) $(CPPFLAGS) $(DEFINES)
 
 loader.bin: threads/loader.o
-	$(LD) -N -e 0 -Ttext 0x7c00 --oformat binary -o $@ $<
+	$(LD) -N -e 0 -Ttext 0x7c00 -o loader.elf $<
+	$(OBJCOPY) -O binary -R .note -R .comment -R .note.gnu.property -R .note.gnu.build-id -S loader.elf $@
+	rm -f loader.elf
 
 os.dsk: kernel.bin
 	cat $^ > $@
